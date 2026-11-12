@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f6b26b">
+<title>Late to Class</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #1b1d22;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ---------- Setup ----------
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, horizon = 0, groundY = 0, lanePx = 0;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  horizon = H * 0.36;
+  groundY = H * 0.86;
+  lanePx = Math.min(W * 0.29, 150);
+}
+window.addEventListener("resize", resize);
+resize();
+
+// World units: lanes are 1 apart (x = -1, 0, 1), z is distance ahead of the runner, h is height.
+const FOCAL = 5;
+const FAR = 70;
+
+function project(x, z, h) {
+  const s = FOCAL / (FOCAL + z);
+  return {
+    x: W / 2 + x * lanePx * s,
+    y: horizon + (groundY - horizon) * s - h * lanePx * 0.95 * s,
+    s: s
+  };
+}
+
+function fogAlpha(z) {
+  return Math.max(0, Math.min(1, 1 - (z - 45) / 25));
+}
+
+// ---------- Best score ----------
+
+const BEST_KEY = "lateToClassBest";
+function loadBest() {
+  try { return parseInt(localStorage.getItem(BEST_KEY), 10) || 0; } catch (e) { return 0; }
+}
+function saveBest(value) {
+  try { localStorage.setItem(BEST_KEY, String(value)); } catch (e) { /* storage blocked */ }
+}
+
+// ---------- Game state ----------
+
+let state = "start";      // "start", "play", "over"
+let best = loadBest();
+let player, objects, scenery, speed, distance, elapsed, timeLeft, coffees, score;
+let sinceRow, overReason, overAt, flash, newBest, popups;
+
+function reset() {
+  player = { lane: 0, x: 0, y: 0, vy: 0, slide: 0, phase: 0 };
+  objects = [];
+  scenery = [];
+  popups = [];
+  speed = 12;
+  distance = 0;
+  elapsed = 0;
+  timeLeft = 100;
+  coffees = 0;
+  score = 0;
+  sinceRow = -18;          // a short head start before the first obstacles
+  flash = 0;
+  newBest = false;
+  for (let z = 2; z < FAR; z += 7) addScenery(z);
+}
+reset();
+
+function startGame() {
+  reset();
+  state = "play";
+}
+
+function endGame(reason) {
+  if (state !== "play") return;
+  state = "over";
+  overReason = reason;
+  overAt = performance.now();
+  flash = 1;
+  if (score > best) {
+    best = score;
+    newBest = true;
+    saveBest(best);
+  }
+}
+
+// ---------- Spawning ----------
+
+const OBSTACLES = ["crowd", "bike", "bar"];
+
+function spawnRow() {
+  const lanes = [-1, 0, 1].sort(() => Math.random() - 0.5);
+  const blocked = Math.random() < 0.55 ? 1 : 2;
+  for (let i = 0; i < blocked; i++) {
+    // Crowds can't be jumped or slid under, so never wall off two lanes with them plus a third.
+    let type = OBSTACLES[Math.floor(Math.random() * OBSTACLES.length)];
+    if (speed < 14 && type === "crowd" && Math.random() < 0.5) type = "bike";
+    objects.push({ type: type, lane: lanes[i], z: FAR });
+  }
+  const free = lanes[blocked];
+  if (Math.random() < 0.5) {
+    // A short trail of coffee cups in the open lane.
+    const count = 1 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < count; i++) {
+      objects.push({ type: "coffee", lane: free, z: FAR + i * 2.2, taken: false });
+    }
+  }
+}
+
+function addScenery(z) {
+  for (const side of [-1, 1]) {
+    const roll = Math.random();
+    let type = roll < 0.45 ? "building" : roll < 0.8 ? "tree" : "lamp";
+    scenery.push({
+      type: type,
+      side: side,
+      z: z + Math.random() * 1.5,
+      height: 3.2 + Math.random() * 2.6,
+      hue: Math.floor(Math.random() * 3)
+    });
+  }
+}
+
+// ---------- Input ----------
+
+function moveLane(dir) {
+  if (state !== "play") return;
+  player.lane = Math.max(-1, Math.min(1, player.lane + dir));
+}
+function jump() {
+  if (state !== "play") return;
+  if (player.y <= 0.001) {
+    player.vy = 8.2;
+    player.slide = 0;
+  }
+}
+function slide() {
+  if (state !== "play") return;
+  if (player.y > 0.001) player.vy = -14;   // drop out of a jump fast
+  player.slide = 0.7;
+}
+
+function pressAction() {
+  if (state === "start") startGame();
+  else if (state === "over" && performance.now() - overAt > 600) startGame();
+}
+
+window.addEventListener("keydown", (e) => {
+  const k = e.key;
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", " "].includes(k)) e.preventDefault();
+  if (state !== "play") {
+    if (k === " " || k === "Enter") pressAction();
+    return;
+  }
+  if (k === "ArrowLeft" || k === "a" || k === "A") moveLane(-1);
+  else if (k === "ArrowRight" || k === "d" || k === "D") moveLane(1);
+  else if (k === "ArrowUp" || k === "w" || k === "W" || k === " ") jump();
+  else if (k === "ArrowDown" || k === "s" || k === "S") slide();
+});
+
+// Swipes (touch and mouse drag). A swipe fires as soon as it travels far enough.
+let pointer = null;
+const SWIPE = 28;
+
+canvas.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  pointer = { id: e.pointerId, x: e.clientX, y: e.clientY, fired: false };
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!pointer || pointer.id !== e.pointerId || pointer.fired) return;
+  const dx = e.clientX - pointer.x, dy = e.clientY - pointer.y;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) < SWIPE) return;
+  pointer.fired = true;
+  if (Math.abs(dx) > Math.abs(dy)) moveLane(dx > 0 ? 1 : -1);
+  else if (dy < 0) jump();
+  else slide();
+});
+canvas.addEventListener("pointerup", (e) => {
+  if (pointer && pointer.id === e.pointerId && !pointer.fired) pressAction();
+  pointer = null;
+});
+canvas.addEventListener("pointercancel", () => { pointer = null; });
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+
+// ---------- Update ----------
+
+function update(dt) {
+  if (flash > 0) flash = Math.max(0, flash - dt * 2.5);
+  for (const p of popups) p.t += dt;
+  popups = popups.filter((p) => p.t < 0.8);
+
+  if (state !== "play") {
+    // Gentle idle scroll behind the menus.
+    if (state === "start") scrollWorld(dt * 6, dt);
+    return;
+  }
+
+  elapsed += dt;
+  speed = Math.min(30, 12 + elapsed * 0.28);
+  const step = speed * dt;
+  distance += step;
+  scrollWorld(step, dt);
+
+  // The clock to class keeps ticking, a bit faster as the run goes on.
+  timeLeft -= dt * (6.5 + Math.min(6, elapsed * 0.05));
+  if (timeLeft <= 0) {
+    timeLeft = 0;
+    endGame("late");
+    return;
+  }
+
+  // Lanes, jumping, sliding.
+  player.x += Math.sign(player.lane - player.x) * Math.min(Math.abs(player.lane - player.x), dt * 11);
+  player.vy -= 24 * dt;
+  player.y = Math.max(0, player.y + player.vy * dt);
+  if (player.y === 0) player.vy = 0;
+  player.slide = Math.max(0, player.slide - dt);
+  player.phase += dt * (8 + speed * 0.35);
+
+  // New rows of obstacles.
+  sinceRow += step;
+  const gap = 12 + speed * 0.25;
+  if (sinceRow >= gap) {
+    sinceRow = 0;
+    spawnRow();
+  }
+
+  // Collisions.
+  for (const o of objects) {
+    if (Math.abs(o.z) > 0.55 || Math.abs(o.lane - player.x) > 0.45) continue;
+    if (o.type === "coffee") {
+      if (!o.taken) {
+        o.taken = true;
+        coffees++;
+        timeLeft = Math.min(100, timeLeft + 18);
+        popups.push({ text: "+time ☕", t: 0 });
+      }
+    } else if (o.type === "crowd") {
+      endGame("crowd");
+    } else if (o.type === "bike" && player.y < 0.6) {
+      endGame("bike");
+    } else if (o.type === "bar" && player.slide <= 0) {
+      endGame("bar");
+    }
+  }
+
+  score = Math.floor(distance / 2) + coffees * 10;
+}
+
+function scrollWorld(step, dt) {
+  for (const o of objects) o.z -= step;
+  objects = objects.filter((o) => o.z > -3 && !(o.type === "coffee" && o.taken && o.z < 0));
+  for (const s of scenery) s.z -= step;
+  scenery = scenery.filter((s) => s.z > -4);
+  const farthest = scenery.reduce((m, s) => Math.max(m, s.z), 0);
+  if (farthest < FAR - 7) addScenery(farthest + 7);
+}
+
+// ---------- Drawing helpers ----------
+
+function poly(points, fill) {
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+function roundRect(x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, r);
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+// ---------- Drawing the world ----------
+
+function drawSky() {
+  const sky = ctx.createLinearGradient(0, 0, 0, horizon);
+  sky.addColorStop(0, "#5b8fd6");
+  sky.addColorStop(0.65, "#f3c58a");
+  sky.addColorStop(1, "#f6a96b");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, horizon + 1);
+
+  // Morning sun.
+  ctx.fillStyle = "rgba(255, 236, 190, 0.9)";
+  ctx.beginPath();
+  ctx.arc(W * 0.72, horizon - H * 0.07, Math.min(W, H) * 0.06, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Far skyline with a clock tower: the class you're late for.
+  const base = horizon;
+  ctx.fillStyle = "#b9826a";
+  const blocks = [[-0.48, 0.05], [-0.36, 0.08], [-0.2, 0.06], [0.14, 0.07], [0.3, 0.05], [0.42, 0.09]];
+  for (const [bx, bh] of blocks) {
+    ctx.fillRect(W / 2 + bx * W - W * 0.07, base - H * bh, W * 0.14, H * bh);
+  }
+  const tw = Math.max(18, W * 0.05);
+  const th = H * 0.16;
+  ctx.fillStyle = "#9d6450";
+  ctx.fillRect(W / 2 - tw / 2, base - th, tw, th);
+  ctx.beginPath();
+  ctx.moveTo(W / 2 - tw * 0.65, base - th);
+  ctx.lineTo(W / 2, base - th - tw * 1.1);
+  ctx.lineTo(W / 2 + tw * 0.65, base - th);
+  ctx.fill();
+  // Clock face, with hands that tick forward as the run goes on.
+  const cy = base - th + tw * 0.75;
+  ctx.fillStyle = "#fff6e6";
+  ctx.beginPath();
+  ctx.arc(W / 2, cy, tw * 0.33, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#3a2a24";
+  ctx.lineWidth = Math.max(1.5, tw * 0.06);
+  ctx.lineCap = "round";
+  const minute = elapsed * 0.9 - Math.PI / 2;
+  ctx.beginPath();
+  ctx.moveTo(W / 2, cy);
+  ctx.lineTo(W / 2 + Math.cos(minute) * tw * 0.26, cy + Math.sin(minute) * tw * 0.26);
+  ctx.moveTo(W / 2, cy);
+  ctx.lineTo(W / 2 + Math.cos(-Math.PI / 2 + 0.3) * tw * 0.16, cy + Math.sin(-Math.PI / 2 + 0.3) * tw * 0.16);
+  ctx.stroke();
+}
+
+function drawGround() {
+  ctx.fillStyle = "#6fae5a";
+  ctx.fillRect(0, horizon, W, H - horizon);
+
+  // Sidewalk edges, then the main path.
+  poly([project(-2.05, FAR, 0), project(2.05, FAR, 0), project(2.05, -3, 0), project(-2.05, -3, 0)], "#c9c2b6");
+  poly([project(-1.65, FAR, 0), project(1.65, FAR, 0), project(1.65, -3, 0), project(-1.65, -3, 0)], "#9a9ea6");
+
+  // Moving paving stripes across the path, so speed is easy to feel.
+  const offset = distance % 4;
+  for (let z = -offset; z < FAR; z += 4) {
+    if (z < -3) continue;
+    poly([project(-1.65, z, 0), project(1.65, z, 0), project(1.65, z + 0.25, 0), project(-1.65, z + 0.25, 0)],
+         "rgba(70, 74, 82, 0.18)");
+  }
+  // Lane dashes.
+  for (const lx of [-0.5, 0.5]) {
+    for (let z = -offset * 1; z < FAR; z += 4) {
+      if (z < -3) continue;
+      poly([project(lx - 0.03, z, 0), project(lx + 0.03, z, 0), project(lx + 0.03, z + 1.6, 0), project(lx - 0.03, z + 1.6, 0)],
+           "rgba(255, 255, 255, " + 0.75 * fogAlpha(z) + ")");
+    }
+  }
+  // Haze at the horizon.
+  const haze = ctx.createLinearGradient(0, horizon, 0, horizon + H * 0.08);
+  haze.addColorStop(0, "rgba(246, 200, 150, 0.85)");
+  haze.addColorStop(1, "rgba(246, 200, 150, 0)");
+  ctx.fillStyle = haze;
+  ctx.fillRect(0, horizon, W, H * 0.08);
+}
+
+const BRICKS = ["#a84a3a", "#b85b45", "#8f3f33"];
+
+function drawBuilding(s) {
+  const x = s.side * 2.6;
+  const z1 = s.z, z2 = s.z + 5.2;
+  const h = s.height;
+  ctx.globalAlpha = fogAlpha(z1);
+  // Wall facing the path.
+  poly([project(x, z1, 0), project(x, z2, 0), project(x, z2, h), project(x, z1, h)], BRICKS[s.hue]);
+  // Front face toward you.
+  const far = s.side * 4.6;
+  poly([project(x, z1, 0), project(far, z1, 0), project(far, z1, h), project(x, z1, h)], "#7a3429");
+  // Roof trim.
+  poly([project(x, z1, h), project(x, z2, h), project(x, z2, h + 0.15), project(x, z1, h + 0.15)], "#e8dccb");
+  // Windows.
+  for (let row = 0; row < Math.floor(h / 1.1); row++) {
+    for (let col = 0; col < 3; col++) {
+      const wz = z1 + 0.6 + col * 1.6;
+      const wh = 0.55 + row * 1.1;
+      poly([project(x, wz, wh), project(x, wz + 0.8, wh), project(x, wz + 0.8, wh + 0.55), project(x, wz, wh + 0.55)],
+           "#f7e3b5");
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTree(s) {
+  const p = project(s.side * 2.15, s.z, 0);
+  const u = lanePx * p.s;
+  ctx.globalAlpha = fogAlpha(s.z);
+  ctx.fillStyle = "#6b4a32";
+  ctx.fillRect(p.x - u * 0.06, p.y - u * 0.9, u * 0.12, u * 0.9);
+  ctx.fillStyle = "#3f8a45";
+  ctx.beginPath();
+  ctx.arc(p.x, p.y - u * 1.25, u * 0.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#56a85a";
+  ctx.beginPath();
+  ctx.arc(p.x - u * 0.15, p.y - u * 1.4, u * 0.28, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+function drawLamp(s) {
+  const p = project(s.side * 1.95, s.z, 0);
+  const u = lanePx * p.s;
+  ctx.globalAlpha = fogAlpha(s.z);
+  ctx.fillStyle = "#2f3138";
+  ctx.fillRect(p.x - u * 0.03, p.y - u * 1.7, u * 0.06, u * 1.7);
+  ctx.fillStyle = "#ffe9a8";
+  ctx.beginPath();
+  ctx.arc(p.x, p.y - u * 1.75, u * 0.1, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+// ---------- Drawing obstacles and coffee ----------
+
+const SHIRTS = ["#e05d5d", "#4f7fd9", "#f0b13c", "#7b5cc4", "#3fae8a"];
+
+function drawPerson(cx, groundYpx, u, color, facing) {
+  // A simple student shape: legs, body, head.
+  ctx.fillStyle = "#2d3240";
+  ctx.fillRect(cx - u * 0.1, groundYpx - u * 0.5, u * 0.08, u * 0.5);
+  ctx.fillRect(cx + u * 0.02, groundYpx - u * 0.5, u * 0.08, u * 0.5);
+  roundRect(cx - u * 0.15, groundYpx - u * 1.05, u * 0.3, u * 0.58, u * 0.08, color);
+  ctx.fillStyle = "#e9b48f";
+  ctx.beginPath();
+  ctx.arc(cx, groundYpx - u * 1.18, u * 0.12, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = facing ? "#3b2a20" : "#16120f";
+  ctx.beginPath();
+  ctx.arc(cx, groundYpx - u * 1.23, u * 0.12, Math.PI, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawCrowd(o) {
+  const p = project(o.lane, o.z, 0);
+  const u = lanePx * p.s;
+  const seed = Math.abs(Math.round(o.lane * 7 + o.z * 0)) % SHIRTS.length;
+  drawPerson(p.x - u * 0.27, p.y - u * 0.04, u * 0.92, SHIRTS[seed], true);
+  drawPerson(p.x + u * 0.27, p.y - u * 0.04, u * 0.95, SHIRTS[(seed + 2) % SHIRTS.length], true);
+  drawPerson(p.x, p.y, u * 1.05, SHIRTS[(seed + 1) % SHIRTS.length], true);
+  // Speech bubble: they're chatting in the middle of the path.
+  ctx.fillStyle = "rgba(255, 255, 255, 0.92)";
+  roundRect(p.x + u * 0.18, p.y - u * 1.75, u * 0.42, u * 0.24, u * 0.08, "rgba(255, 255, 255, 0.92)");
+  ctx.fillStyle = "#555";
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.arc(p.x + u * (0.28 + i * 0.11), p.y - u * 1.63, u * 0.025, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawBike(o) {
+  const p = project(o.lane, o.z, 0);
+  const u = lanePx * p.s;
+  // Seen from the front: a wheel, a frame, handlebars, and a rider.
+  ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
+  ctx.beginPath();
+  ctx.ellipse(p.x, p.y, u * 0.35, u * 0.07, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#1e1f24";
+  roundRect(p.x - u * 0.05, p.y - u * 0.42, u * 0.1, u * 0.42, u * 0.05, "#1e1f24");
+  ctx.strokeStyle = "#d33a3a";
+  ctx.lineWidth = Math.max(2, u * 0.05);
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y - u * 0.25);
+  ctx.lineTo(p.x, p.y - u * 0.55);
+  ctx.stroke();
+  ctx.strokeStyle = "#cfd3da";
+  ctx.beginPath();
+  ctx.moveTo(p.x - u * 0.3, p.y - u * 0.58);
+  ctx.lineTo(p.x + u * 0.3, p.y - u * 0.58);
+  ctx.stroke();
+  // Headlight.
+  ctx.fillStyle = "#fff4b8";
+  ctx.beginPath();
+  ctx.arc(p.x, p.y - u * 0.47, u * 0.045, 0, Math.PI * 2);
+  ctx.fill();
+  // Low "JUMP" hint sign on the basket.
+  roundRect(p.x - u * 0.16, p.y - u * 0.36, u * 0.32, u * 0.14, u * 0.03, "#f3c44d");
+}
+
+function drawBar(o) {
+  const a = project(o.lane - 0.42, o.z, 0);
+  const b = project(o.lane + 0.42, o.z, 0);
+  const u = lanePx * a.s;
+  const top = project(o.lane, o.z, 1.2).y;
+  const low = project(o.lane, o.z, 0.85).y;
+  // Posts.
+  ctx.fillStyle = "#4a4d55";
+  ctx.fillRect(a.x - u * 0.04, top, u * 0.08, a.y - top);
+  ctx.fillRect(b.x - u * 0.04, top, u * 0.08, b.y - top);
+  // Striped caution bar to slide under.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(a.x, top, b.x - a.x, low - top);
+  ctx.clip();
+  ctx.fillStyle = "#f2c230";
+  ctx.fillRect(a.x, top, b.x - a.x, low - top);
+  ctx.fillStyle = "#1c1c1c";
+  const stripe = u * 0.18;
+  for (let x = a.x - (low - top); x < b.x; x += stripe * 2) {
+    ctx.beginPath();
+    ctx.moveTo(x, low);
+    ctx.lineTo(x + stripe, low);
+    ctx.lineTo(x + stripe + (low - top), top);
+    ctx.lineTo(x + (low - top), top);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawCoffee(o, time) {
+  const bob = Math.sin(time * 4 + o.z) * 0.06;
+  const p = project(o.lane, o.z, 0.45 + bob);
+  const u = lanePx * p.s;
+  // Glow.
+  const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, u * 0.42);
+  glow.addColorStop(0, "rgba(255, 230, 160, 0.75)");
+  glow.addColorStop(1, "rgba(255, 230, 160, 0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, u * 0.42, 0, Math.PI * 2);
+  ctx.fill();
+  // Cup, sleeve, lid.
+  const w = u * 0.24, h = u * 0.32;
+  ctx.fillStyle = "#fbf7f0";
+  ctx.beginPath();
+  ctx.moveTo(p.x - w / 2, p.y - h / 2);
+  ctx.lineTo(p.x + w / 2, p.y - h / 2);
+  ctx.lineTo(p.x + w * 0.38, p.y + h / 2);
+  ctx.lineTo(p.x - w * 0.38, p.y + h / 2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = "#9b6a43";
+  ctx.fillRect(p.x - w * 0.46, p.y - h * 0.08, w * 0.92, h * 0.3);
+  roundRect(p.x - w * 0.6, p.y - h * 0.68, w * 1.2, h * 0.2, h * 0.08, "#3a2c26");
+}
+
+// ---------- Drawing the runner ----------
+
+function drawPlayer(time) {
+  const ground = project(player.x, 0, 0);
+  const u = lanePx * ground.s;
+
+  // Shadow shrinks as you jump.
+  const shrink = 1 / (1 + player.y * 0.8);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+  ctx.beginPath();
+  ctx.ellipse(ground.x, ground.y, u * 0.28 * shrink, u * 0.07 * shrink, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const p = project(player.x, 0, player.y);
+  const x = p.x, y = p.y;
+  const shirt = "#2f6fd1";
+
+  if (player.slide > 0 && player.y <= 0.001) {
+    // Sliding: low and stretched out, backpack on top.
+    roundRect(x - u * 0.3, y - u * 0.3, u * 0.6, u * 0.26, u * 0.1, shirt);
+    roundRect(x - u * 0.2, y - u * 0.46, u * 0.4, u * 0.2, u * 0.07, "#c8423a");
+    ctx.fillStyle = "#3b2a20";
+    ctx.beginPath();
+    ctx.arc(x, y - u * 0.2, u * 0.12, Math.PI, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+
+  const swing = state === "play" && player.y <= 0.001 ? Math.sin(player.phase) : 0.3;
+  // Legs.
+  ctx.fillStyle = "#283041";
+  ctx.fillRect(x - u * 0.12, y - u * 0.5 + Math.max(0, swing) * u * 0.12, u * 0.1, u * 0.5 - Math.max(0, swing) * u * 0.12);
+  ctx.fillRect(x + u * 0.02, y - u * 0.5 + Math.max(0, -swing) * u * 0.12, u * 0.1, u * 0.5 - Math.max(0, -swing) * u * 0.12);
+  // Sneakers.
+  ctx.fillStyle = "#f4f4f4";
+  ctx.fillRect(x - u * 0.13, y - u * 0.06 + Math.max(0, swing) * u * 0.0, u * 0.12, u * 0.06);
+  ctx.fillRect(x + u * 0.01, y - u * 0.06, u * 0.12, u * 0.06);
+  // Arms.
+  ctx.fillStyle = "#e9b48f";
+  ctx.fillRect(x - u * 0.24, y - u * 0.95 + swing * u * 0.08, u * 0.07, u * 0.38);
+  ctx.fillRect(x + u * 0.17, y - u * 0.95 - swing * u * 0.08, u * 0.07, u * 0.38);
+  // Body.
+  roundRect(x - u * 0.18, y - u * 1.02, u * 0.36, u * 0.56, u * 0.09, shirt);
+  // Backpack, bouncing a little with each step.
+  const bounce = Math.abs(swing) * u * 0.03;
+  roundRect(x - u * 0.15, y - u * 0.98 - bounce, u * 0.3, u * 0.4, u * 0.08, "#c8423a");
+  roundRect(x - u * 0.1, y - u * 0.74 - bounce, u * 0.2, u * 0.12, u * 0.04, "#a7322c");
+  // Head (from behind: hair).
+  ctx.fillStyle = "#e9b48f";
+  ctx.beginPath();
+  ctx.arc(x, y - u * 1.15, u * 0.13, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#3b2a20";
+  ctx.beginPath();
+  ctx.arc(x, y - u * 1.17, u * 0.135, Math.PI * 0.95, Math.PI * 2.05);
+  ctx.fill();
+  ctx.fillRect(x - u * 0.13, y - u * 1.18, u * 0.26, u * 0.08);
+}
+
+// ---------- HUD and screens ----------
+
+function topInset() {
+  return 14;
+}
+
+function drawHUD() {
+  const pad = 14;
+  const top = topInset();
+  ctx.textBaseline = "top";
+
+  // Score and best.
+  ctx.font = "800 26px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = "#fff";
+  ctx.shadowColor = "rgba(0,0,0,0.35)";
+  ctx.shadowBlur = 6;
+  ctx.textAlign = "left";
+  ctx.fillText(score, pad, top);
+  ctx.font = "600 13px system-ui, -apple-system, sans-serif";
+  ctx.fillText("BEST " + best, pad, top + 30);
+  ctx.textAlign = "right";
+  ctx.font = "700 16px system-ui, -apple-system, sans-serif";
+  ctx.fillText("☕ " + coffees, W - pad, top + 4);
+  ctx.shadowBlur = 0;
+
+  // Time-to-class bar.
+  const bw = Math.min(W * 0.46, 230), bh = 14;
+  const bx = W / 2 - bw / 2, by = top + 8;
+  roundRect(bx - 2, by - 2, bw + 4, bh + 4, 9, "rgba(0, 0, 0, 0.35)");
+  const frac = timeLeft / 100;
+  const low = frac < 0.28;
+  const pulse = low ? 0.6 + 0.4 * Math.abs(Math.sin(performance.now() / 120)) : 1;
+  roundRect(bx, by, Math.max(bh, bw * frac), bh, 7,
+            low ? "rgba(235, 64, 52, " + pulse + ")" : frac < 0.55 ? "#f0b13c" : "#46c46a");
+  ctx.textAlign = "center";
+  ctx.font = "700 11px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = "#fff";
+  ctx.fillText(low ? "HURRY! CLASS IS STARTING" : "TIME TILL CLASS", W / 2, by + bh + 6);
+
+  // "+time" popups.
+  for (const p of popups) {
+    ctx.globalAlpha = 1 - p.t / 0.8;
+    ctx.font = "800 18px system-ui, -apple-system, sans-serif";
+    ctx.fillStyle = "#fff4c2";
+    ctx.fillText(p.text, W / 2, groundY - lanePx * 1.6 - p.t * 50);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function panel(y, h) {
+  const w = Math.min(W - 40, 340);
+  roundRect(W / 2 - w / 2, y, w, h, 22, "rgba(20, 22, 30, 0.82)");
+  return w;
+}
+
+function button(label, y) {
+  const w = Math.min(W - 90, 230), h = 54;
+  roundRect(W / 2 - w / 2, y, w, h, 27, "#f6b23c");
+  ctx.fillStyle = "#2a1e0a";
+  ctx.font = "800 20px system-ui, -apple-system, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, W / 2, y + h / 2 + 1);
+}
+
+function drawStart() {
+  ctx.fillStyle = "rgba(0, 0, 0, 0.25)";
+  ctx.fillRect(0, 0, W, H);
+  const y = H * 0.16;
+  panel(y, 330);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#f6b23c";
+  ctx.font = "900 40px system-ui, -apple-system, sans-serif";
+  ctx.fillText("LATE TO", W / 2, y + 26);
+  ctx.fillStyle = "#fff";
+  ctx.fillText("CLASS", W / 2, y + 68);
+  ctx.font = "500 15px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = "#d9dbe2";
+  const lines = [
+    "Swipe ← → to switch lanes",
+    "Swipe ↑ to jump bikes",
+    "Swipe ↓ to slide under bars",
+    "Grab ☕ before time runs out!"
+  ];
+  lines.forEach((t, i) => ctx.fillText(t, W / 2, y + 128 + i * 24));
+  button("TAP TO RUN", y + 240);
+  if (best > 0) {
+    ctx.textBaseline = "top";
+    ctx.font = "600 13px system-ui, -apple-system, sans-serif";
+    ctx.fillStyle = "#fff";
+    ctx.fillText("Best: " + best, W / 2, y + 340);
+  }
+}
+
+const REASONS = {
+  late: ["YOU'RE LATE!", "The professor already started."],
+  crowd: ["BUMPED!", "You ran into a crowd of students."],
+  bike: ["WATCH OUT!", "A bike got you. Jump next time!"],
+  bar: ["OUCH!", "Slide under the caution bars."]
+};
+
+function drawOver() {
+  ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+  ctx.fillRect(0, 0, W, H);
+  const y = H * 0.2;
+  panel(y, 300);
+  const [title, sub] = REASONS[overReason] || REASONS.crowd;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = overReason === "late" ? "#ff6b5e" : "#f6b23c";
+  ctx.font = "900 34px system-ui, -apple-system, sans-serif";
+  ctx.fillText(title, W / 2, y + 26);
+  ctx.fillStyle = "#d9dbe2";
+  ctx.font = "500 14px system-ui, -apple-system, sans-serif";
+  ctx.fillText(sub, W / 2, y + 70);
+  ctx.fillStyle = "#fff";
+  ctx.font = "900 48px system-ui, -apple-system, sans-serif";
+  ctx.fillText(score, W / 2, y + 100);
+  ctx.font = "600 14px system-ui, -apple-system, sans-serif";
+  ctx.fillStyle = newBest ? "#7fe08f" : "#d9dbe2";
+  ctx.fillText(newBest ? "NEW BEST!" : "Best: " + best, W / 2, y + 156);
+  ctx.fillStyle = "#d9dbe2";
+  ctx.fillText("☕ " + coffees + (coffees === 1 ? " coffee" : " coffees"), W / 2, y + 178);
+  button("PLAY AGAIN", y + 220);
+}
+
+// ---------- Main loop ----------
+
+let last = performance.now();
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+
+  drawSky();
+  drawGround();
+
+  // Draw everything from far to near so closer things cover farther ones.
+  const items = [];
+  for (const s of scenery) items.push({ z: s.z + (s.type === "building" ? 5.2 : 0), draw: () => {
+    if (s.type === "building") drawBuilding(s);
+    else if (s.type === "tree") drawTree(s);
+    else drawLamp(s);
+  } });
+  for (const o of objects) {
+    if (o.taken) continue;
+    items.push({ z: o.z, draw: () => {
+      ctx.globalAlpha = fogAlpha(o.z);
+      if (o.type === "crowd") drawCrowd(o);
+      else if (o.type === "bike") drawBike(o);
+      else if (o.type === "bar") drawBar(o);
+      else drawCoffee(o, now / 1000);
+      ctx.globalAlpha = 1;
+    } });
+  }
+  items.push({ z: 0.01, draw: () => drawPlayer(now / 1000) });
+  items.sort((a, b) => b.z - a.z);
+  for (const it of items) it.draw();
+
+  if (state !== "start") drawHUD();
+  if (state === "start") drawStart();
+  if (state === "over") drawOver();
+
+  if (flash > 0) {
+    ctx.fillStyle = "rgba(255, 255, 255, " + flash * 0.6 + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
